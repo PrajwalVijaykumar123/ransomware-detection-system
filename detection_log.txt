@@ -1,0 +1,4 @@
+[2026-10-03T22:31:00.810897] [INFO] Monitoring started on: test_target (auto-contain: True)
+[2026-10-03T22:31:17.738017] [CRITICAL] MASS FILE MODIFICATION DETECTED: 10 changes in 10s. This matches ransomware encryption behavior.
+[2026-10-03T22:31:17.738164] [CRITICAL] CONTAINMENT ACTION TAKEN: write access revoked on test_target. Restore with: chmod u+w test_target
+[2026-10-03T22:31:19.744041] [ALERT] ALERT on /Users/prajwalvijaykumar/Desktop/Cybersecurity/SOC-projects/ransomware-detection-system/test_target/document_3.txt: High entropy detected: 7.91/8.0 (likely encrypted)
