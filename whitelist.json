@@ -1,0 +1,34 @@
+{
+  "_comment": "Paths, extensions, and filename patterns excluded from mass-modification counting and entropy alerts. Use this for directories touched by legitimate bulk operations (backup tools, sync clients, build systems) that would otherwise look like ransomware encrypting many files quickly.",
+
+  "whitelisted_paths": [
+    ".git/",
+    "node_modules/",
+    "__pycache__/",
+    ".venv/",
+    "venv/"
+  ],
+
+  "whitelisted_extensions": [
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".log"
+  ],
+
+  "whitelisted_filename_patterns": [
+    "~$",
+    ".tmp",
+    ".swp",
+    ".bak"
+  ],
+
+  "trusted_process_names": [
+    "rsync",
+    "backup-agent",
+    "Dropbox",
+    "OneDrive",
+    "Time Machine"
+  ]
+}

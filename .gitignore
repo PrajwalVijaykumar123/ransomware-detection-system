@@ -1,4 +1,10 @@
-venv/
-test_target/
 __pycache__/
 *.pyc
+venv/
+.venv/
+
+# Generated at runtime - not committed
+detection_log.txt
+detection_report.json
+dashboard.html
+test_target/

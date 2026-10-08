@@ -2,7 +2,7 @@
 Ransomware Behavior Simulator (SAFE)
 
 This does NOT contain any real encryption, malicious code, or actual ransomware.
-It only mimics the observable behavior of ransomware for testing the detector:
+It only mimics the *observable behavior* of ransomware for testing the detector:
 1. Creates a batch of test files
 2. Rapidly "encrypts" them by overwriting with random bytes (high entropy, like real
    encrypted output) and renaming with a suspicious extension
@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import random
+import shutil
 
 RANSOM_NOTE_TEXT = """
 YOUR FILES HAVE BEEN ENCRYPTED!
@@ -41,22 +42,28 @@ def create_test_files(target_dir, count=15):
 
 
 def simulate_encryption(target_dir, delay=0.3):
+    """Overwrites each file with random bytes and renames with a suspicious
+    extension - mimicking ransomware's observable behavior without using any
+    real cryptographic or malicious code."""
     files = [f for f in os.listdir(target_dir) if os.path.isfile(os.path.join(target_dir, f))]
 
     print(f"Simulating rapid 'encryption' of {len(files)} files...")
     for filename in files:
         file_path = os.path.join(target_dir, filename)
 
+        # Overwrite with random bytes (high entropy, like real encrypted output)
         random_data = bytes(random.getrandbits(8) for _ in range(2048))
         with open(file_path, "wb") as f:
             f.write(random_data)
 
+        # Rename with suspicious extension
         new_path = file_path + ".locked"
         os.rename(file_path, new_path)
 
         print(f"  'Encrypted': {filename} -> {os.path.basename(new_path)}")
-        time.sleep(delay)
+        time.sleep(delay)  # simulate rapid but not instant file changes
 
+    # Drop fake ransom note
     note_path = os.path.join(target_dir, "README_DECRYPT.txt")
     with open(note_path, "w") as f:
         f.write(RANSOM_NOTE_TEXT)

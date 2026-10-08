@@ -18,6 +18,7 @@ import math
 import time
 import stat
 import json
+import fnmatch
 from collections import deque
 from datetime import datetime
 
@@ -25,24 +26,78 @@ import yara
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-ENTROPY_THRESHOLD = 7.5
-MASS_CHANGE_WINDOW_SECONDS = 10
-MASS_CHANGE_THRESHOLD = 10
+# ---------- Config ----------
+ENTROPY_THRESHOLD = 7.5          # out of 8.0 max; encrypted/compressed data is typically 7.5+
+MASS_CHANGE_WINDOW_SECONDS = 10  # time window to measure change rate
+MASS_CHANGE_THRESHOLD = 10       # number of file changes within window to trigger alert
 SUSPICIOUS_EXTENSIONS = [
     ".locked", ".encrypted", ".crypto", ".crypt", ".enc", ".ransom",
     ".locky", ".cerber", ".zepto", ".wcry", ".wncry",
 ]
-RANSOM_NOTE_KEYWORDS = [
-    "your files have been encrypted",
-    "decrypt",
-    "bitcoin",
-    "ransom",
-    "pay",
-    "private key",
-]
+YARA_RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules", "ransom_notes.yar")
+WHITELIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist.json")
+
+
+def load_yara_rules(rules_path=YARA_RULES_PATH):
+    """Compiles the YARA ransom-note ruleset once at startup. Falls back to
+    None (and a warning) if the rules file is missing or fails to compile,
+    so the detector still runs on entropy + extension signals alone."""
+    try:
+        return yara.compile(filepath=rules_path)
+    except Exception as e:
+        print(f"[WARN] Could not load YARA rules from {rules_path}: {e}")
+        print("[WARN] Continuing without ransom-note language detection.")
+        return None
+
+
+def load_whitelist(whitelist_path=WHITELIST_PATH):
+    """Loads path/extension/filename patterns to exclude from detection so
+    legitimate bulk operations (backups, syncs, builds) don't trip the
+    mass-modification or entropy alerts as false positives."""
+    default = {
+        "whitelisted_paths": [],
+        "whitelisted_extensions": [],
+        "whitelisted_filename_patterns": [],
+    }
+    try:
+        with open(whitelist_path, "r") as f:
+            data = json.load(f)
+        default.update({k: v for k, v in data.items() if k in default})
+        return default
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        print(f"[WARN] Could not load whitelist from {whitelist_path}: {e}")
+        return default
+
+
+def is_whitelisted(file_path, whitelist):
+    """Returns True if a file should be excluded from detection entirely -
+    it matches a whitelisted directory, extension, or filename pattern."""
+    normalized = file_path.replace("\\", "/")
+
+    for path_fragment in whitelist["whitelisted_paths"]:
+        if path_fragment.strip("/") in normalized.split("/"):
+            return True
+
+    _, ext = os.path.splitext(file_path)
+    if ext.lower() in [e.lower() for e in whitelist["whitelisted_extensions"]]:
+        return True
+
+    filename = os.path.basename(file_path)
+    for pattern in whitelist["whitelisted_filename_patterns"]:
+        if pattern.startswith("~") or pattern.startswith("."):
+            if pattern in filename or fnmatch.fnmatch(filename, f"*{pattern}*"):
+                return True
+        elif fnmatch.fnmatch(filename, pattern):
+            return True
+
+    return False
 
 
 def calculate_entropy(file_path, sample_size=4096):
+    """Shannon entropy of a file's first N bytes. High entropy (~7.5-8.0) suggests
+    encrypted or compressed data - a strong ransomware indicator."""
     try:
         with open(file_path, "rb") as f:
             data = f.read(sample_size)
@@ -67,25 +122,45 @@ def calculate_entropy(file_path, sample_size=4096):
     return entropy
 
 
-def check_ransom_note(file_path):
+def check_ransom_note(file_path, yara_rules):
+    """Matches a text file's content and filename against the compiled YARA
+    ransom-note ruleset. Returns (is_note, list of matched rule names) so
+    the detector catches ransom-note *phrasing* generically - including
+    from families it has never seen a keyword list for - rather than only
+    exact substrings."""
+    if yara_rules is None:
+        return False, []
+
     try:
         with open(file_path, "r", errors="ignore") as f:
-            content = f.read(5000).lower()
+            content = f.read(5000)
     except Exception:
         return False, []
 
-    matched = [kw for kw in RANSOM_NOTE_KEYWORDS if kw in content]
-    return len(matched) >= 2, matched
+    try:
+        matches = yara_rules.match(data=content)
+        # Filename-pattern rule needs the actual filename, not file content
+        filename_matches = yara_rules.match(data=os.path.basename(file_path))
+        all_matches = {m.rule for m in matches} | {
+            m.rule for m in filename_matches if m.rule == "Ransom_Note_Filename_Pattern"
+        }
+    except Exception:
+        return False, []
+
+    return len(all_matches) > 0, sorted(all_matches)
 
 
 class RansomwareDetectionHandler(FileSystemEventHandler):
-    def __init__(self, watch_dir, log_path, auto_contain=False):
+    def __init__(self, watch_dir, log_path, auto_contain=False, yara_rules=None, whitelist=None):
         self.watch_dir = watch_dir
         self.log_path = log_path
         self.auto_contain = auto_contain
         self.recent_changes = deque()
         self.contained = False
         self.alerts = []
+        self.yara_rules = yara_rules
+        self.whitelist = whitelist or load_whitelist()
+        self.whitelisted_skips = 0
 
     def log(self, message, level="INFO"):
         timestamp = datetime.now().isoformat()
@@ -105,6 +180,10 @@ class RansomwareDetectionHandler(FileSystemEventHandler):
         if not os.path.isfile(file_path):
             return
 
+        if is_whitelisted(file_path, self.whitelist):
+            self.whitelisted_skips += 1
+            return
+
         findings = []
 
         _, ext = os.path.splitext(file_path)
@@ -116,9 +195,9 @@ class RansomwareDetectionHandler(FileSystemEventHandler):
             findings.append(f"High entropy detected: {entropy:.2f}/8.0 (likely encrypted)")
 
         if ext.lower() in [".txt", ".html", ".hta"]:
-            is_note, keywords = check_ransom_note(file_path)
+            is_note, matched_rules = check_ransom_note(file_path, self.yara_rules)
             if is_note:
-                findings.append(f"Ransom note language detected: {keywords}")
+                findings.append(f"Ransom note language detected (YARA: {matched_rules})")
 
         if findings:
             self.alerts.append({
@@ -133,6 +212,10 @@ class RansomwareDetectionHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if event.is_directory:
+            return
+
+        if is_whitelisted(event.src_path, self.whitelist):
+            self.whitelisted_skips += 1
             return
 
         self.analyze_file(event.src_path)
@@ -153,6 +236,9 @@ class RansomwareDetectionHandler(FileSystemEventHandler):
         self.analyze_file(event.src_path)
 
     def contain(self):
+        """Removes write permission from the monitored directory to stop
+        further file modification. This is a real, reversible containment
+        action - restore with: chmod u+w <directory>"""
         try:
             current_mode = os.stat(self.watch_dir).st_mode
             os.chmod(self.watch_dir, current_mode & ~stat.S_IWUSR)
@@ -171,12 +257,20 @@ def monitor_directory(watch_dir, log_path="detection_log.txt", auto_contain=Fals
         print(f"Directory not found: {watch_dir}")
         sys.exit(1)
 
-    handler = RansomwareDetectionHandler(watch_dir, log_path, auto_contain)
+    yara_rules = load_yara_rules()
+    whitelist = load_whitelist()
+
+    handler = RansomwareDetectionHandler(watch_dir, log_path, auto_contain, yara_rules, whitelist)
     observer = Observer()
     observer.schedule(handler, watch_dir, recursive=True)
     observer.start()
 
-    handler.log(f"Monitoring started on: {watch_dir} (auto-contain: {auto_contain})")
+    handler.log(
+        f"Monitoring started on: {watch_dir} (auto-contain: {auto_contain}, "
+        f"yara_rules: {'loaded' if yara_rules else 'unavailable'}, "
+        f"whitelist_paths: {len(whitelist['whitelisted_paths'])}, "
+        f"whitelist_extensions: {len(whitelist['whitelisted_extensions'])})"
+    )
     print(f"Watching {watch_dir} for ransomware-like activity. Press Ctrl+C to stop.\n")
 
     try:
@@ -196,11 +290,16 @@ def monitor_directory(watch_dir, log_path="detection_log.txt", auto_contain=Fals
             "watch_dir": watch_dir,
             "total_alerts": len(handler.alerts),
             "contained": handler.contained,
+            "whitelisted_events_skipped": handler.whitelisted_skips,
             "alerts": handler.alerts,
         }
         with open("detection_report.json", "w") as f:
             json.dump(summary, f, indent=2)
-        print(f"\nSummary: {len(handler.alerts)} alert(s). Full report saved to detection_report.json")
+        print(
+            f"\nSummary: {len(handler.alerts)} alert(s), "
+            f"{handler.whitelisted_skips} whitelisted event(s) skipped. "
+            f"Full report saved to detection_report.json"
+        )
 
 
 if __name__ == "__main__":
